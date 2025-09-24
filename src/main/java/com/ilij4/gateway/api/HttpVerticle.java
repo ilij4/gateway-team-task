@@ -1,4 +1,4 @@
-package com.ilij4.gateway.http;
+package com.ilij4.gateway.api;
 
 import com.ilij4.gateway.config.ConfigKeys;
 import io.vertx.core.AbstractVerticle;

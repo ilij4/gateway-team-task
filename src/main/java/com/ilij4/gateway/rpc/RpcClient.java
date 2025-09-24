@@ -1,6 +1,7 @@
 package com.ilij4.gateway.rpc;
 
 import io.vertx.core.Future;
+import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientOptions;
@@ -9,16 +10,17 @@ import io.vertx.ext.web.client.WebClientOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class UpstreamClient {
+public class RpcClient {
+    private final Vertx vertx;
     private final WebClient client;
-    private final String upstreamUrl;
+    private final String rpcUrl;
     private final int timeoutMs;
 
-    private static final Logger log = LoggerFactory.getLogger(UpstreamClient.class);
+    private static final Logger log = LoggerFactory.getLogger(RpcClient.class);
 
-
-    public UpstreamClient(Vertx vertx, String upstreamUrl, int timeoutMs) {
-        this.upstreamUrl = upstreamUrl;
+    public RpcClient(Vertx vertx, String rpcUrl, int timeoutMs) {
+        this.vertx = vertx;
+        this.rpcUrl = rpcUrl;
         this.timeoutMs = timeoutMs;
 
         HttpClientOptions httpOpts = new HttpClientOptions()
@@ -30,24 +32,65 @@ public class UpstreamClient {
     }
 
     public Future<Buffer> forward(Buffer body) {
-        log.info("Sending request to {} ({} bytes)", upstreamUrl, body.toString());
+        return forward(RpcRequest.of(body).build());
+    }
 
-        return client.postAbs(upstreamUrl)
-                .timeout(timeoutMs)
+    public Future<Buffer> forward(RpcRequest req) {
+        final int effectiveTimeout = req.timeoutMs() != null ? req.timeoutMs() : this.timeoutMs;
+
+        // concise, safe logging (no payload dump)
+        log.info("RPC -> {} ({} bytes) corrId={}", rpcUrl, req.body().length(), req.correlationId());
+
+        Promise<Buffer> promise = Promise.promise();
+        sendWithRetry(req, effectiveTimeout, 0, promise);
+        return promise.future();
+    }
+
+    private void sendWithRetry(RpcRequest req, int timeout, int attempt, Promise<Buffer> sink) {
+        client.postAbs(rpcUrl)
+                .timeout(timeout)
                 .putHeader("Content-Type", "application/json")
-                .sendBuffer(body)
+                .putHeader("User-Agent", "gateway/1.0")
+                .sendBuffer(req.body())
                 .compose(resp -> {
                     int sc = resp.statusCode();
                     if (sc >= 200 && sc < 300) {
                         Buffer b = resp.bodyAsBuffer();
                         return Future.succeededFuture(b != null ? b : Buffer.buffer("null"));
                     } else {
-                        String responseBody = null;
-                        Buffer b = resp.bodyAsBuffer();
-                        if (b != null) responseBody = b.toString();
-                        return Future.failedFuture(new UpstreamException(sc, responseBody));
+                        return Future.failedFuture(new UpstreamException(sc, resp.bodyAsString()));
+                    }
+                })
+                .onSuccess(sink::complete)
+                .onFailure(err -> {
+                    int max = req.maxRetries();
+                    if (attempt < max && shouldRetry(err)) {
+                        vertx.setTimer(backoffMs(attempt), t -> sendWithRetry(req, timeout, attempt + 1, sink));
+                    } else {
+                        sink.fail(err);
                     }
                 });
+    }
+
+    public Future<Void> forwardStreaming(RpcRequest req, io.vertx.core.http.HttpServerResponse out) {
+        Promise<Void> p = Promise.promise();
+        client.postAbs(rpcUrl)
+                .timeout(req.timeoutMs() != null ? req.timeoutMs() : timeoutMs)
+                .putHeader("Content-Type", "application/json")
+                .sendBuffer(req.body());
+        return p.future();
+    }
+
+    private boolean shouldRetry(Throwable t) {
+        if (t instanceof UpstreamException ue) {
+            return ue.status == 429 || ue.status == 502 || ue.status == 503 || ue.status == 504;
+        }
+        return false;
+    }
+
+    private long backoffMs(int attempt) { // jittered exponential-ish
+        long base = (long)Math.min(1000 * Math.pow(2, attempt), 4000);
+        return base + (long)(Math.random() * 300);
     }
 
     public static class UpstreamException extends RuntimeException {

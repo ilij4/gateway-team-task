@@ -1,4 +1,4 @@
-package com.ilij4.gateway.http;
+package com.ilij4.gateway.api;
 
 import io.vertx.core.Handler;
 import io.vertx.ext.web.RoutingContext;

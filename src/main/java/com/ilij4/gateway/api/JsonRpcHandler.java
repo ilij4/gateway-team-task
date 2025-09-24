@@ -1,9 +1,11 @@
-package com.ilij4.gateway.http;
+package com.ilij4.gateway.api;
 
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.ilij4.gateway.rpc.RpcClient;
+import com.ilij4.gateway.rpc.RpcRequest;
+import com.ilij4.gateway.services.MetricsService;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpHeaders;
@@ -11,18 +13,20 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 
 import java.io.IOException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.LongAdder;
 
 
 public class JsonRpcHandler implements Handler<RoutingContext> {
-    private final RpcClient upstream;
-    private final ConcurrentHashMap<String, LongAdder> counters;
+    private final RpcClient rpcClient;
+    private final MetricsService metrics;
     private final JsonFactory factory = new JsonFactory();
 
-    public JsonRpcHandler(RpcClient upstream, ConcurrentHashMap<String, LongAdder> counters) {
-        this.upstream = upstream;
-        this.counters = counters;
+    private final int MAX_RETRIES = 3;
+    private final int MAX_TIMEOUT = 20_000;
+
+
+    public JsonRpcHandler(RpcClient upstream, MetricsService metrics) {
+        this.rpcClient = upstream;
+        this.metrics = metrics;
     }
 
     @Override
@@ -42,13 +46,16 @@ public class JsonRpcHandler implements Handler<RoutingContext> {
             return;
         }
 
-        upstream.forward(body).onSuccess(resp -> {
-            ctx.response().setStatusCode(200).end(resp);
-        }).onFailure(err -> {
+        var req = RpcRequest.of(body)
+                .timeoutMs(MAX_TIMEOUT)
+                .maxRetries(MAX_RETRIES)
+                .build();
+
+        rpcClient.forward(req).onSuccess(resp -> ctx.response().setStatusCode(200).end(resp)).onFailure(err -> {
             if (err instanceof RpcClient.UpstreamException ue) {
                 ctx.response().setStatusCode(mapGatewayStatus(ue.status())).end(ue.body() != null ? ue.body() : "");
             } else {
-                var errObj = jsonRpcError(null, -32000, "upstream error: " + err.getMessage());
+                var errObj = jsonRpcError(-32000, "rpc error: " + err.getMessage());
                 ctx.response().setStatusCode(504).end(errObj.encode());
             }
         });
@@ -73,7 +80,7 @@ public class JsonRpcHandler implements Handler<RoutingContext> {
         while (depth > 0) {
             JsonToken t = p.nextToken();
             if (t == JsonToken.FIELD_NAME) {
-                String name = p.getCurrentName();
+                String name = p.currentName();
                 if ("method".equals(name)) {
                     p.nextToken();
                     if (p.currentToken().isScalarValue()) {
@@ -86,25 +93,23 @@ public class JsonRpcHandler implements Handler<RoutingContext> {
                 depth--;
             } else if (t == null) break;
         }
-        if (method != null && !method.isBlank()) {
-            counters.computeIfAbsent(method, k -> new LongAdder()).increment();
-        }
+
+        if (method != null && !method.isBlank()) metrics.inc(method);
     }
 
     private void badRequest(RoutingContext ctx, String code, String message) {
-        var err = jsonRpcError(null, Integer.parseInt(code), message);
+        var err = jsonRpcError(Integer.parseInt(code), message);
         ctx.response().setStatusCode(400).end(err.encode());
     }
 
-    private JsonObject jsonRpcError(Object id, int code, String message) {
+    private JsonObject jsonRpcError(int code, String message) {
         return new JsonObject()
                 .put("jsonrpc", "2.0")
-                .put("id", id == null ? null : id)
+                .put("id", null)
                 .put("error", new JsonObject().put("code", code).put("message", message));
     }
 
     private int mapGatewayStatus(int upstreamStatus) {
-        // Map upstream 4xx/5xx to gateway 502 or pass-through 4xx if appropriate.
         if (upstreamStatus >= 500) return 502;
         if (upstreamStatus == 408) return 504;
         return upstreamStatus;
